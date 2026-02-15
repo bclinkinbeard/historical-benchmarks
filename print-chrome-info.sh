@@ -1,8 +1,9 @@
 #!/bin/sh
 # print-chrome-info.sh
 #
-# Renders an HTML page in Chrome for Testing that displays the user agent
-# string as a header. Takes a screenshot and also dumps the DOM to stdout.
+# Loads a ~5 MB JSON document in Chrome for Testing, parses it with
+# JSON.parse(), and displays the user agent, parse duration, and current
+# timestamp.  Takes a screenshot and dumps the DOM to stdout.
 #
 # Intended to be used with run-chrome-releases.py:
 #   ./run-chrome-releases.py ./print-chrome-info.sh
@@ -26,29 +27,74 @@ SCREENSHOT_DIR="${SCREENSHOT_DIR:-./screenshots}"
 mkdir -p "$SCREENSHOT_DIR"
 
 TMPHTML=$(mktemp --suffix=.html)
-cleanup() { rm -f "$TMPHTML"; }
+TMPJSON=$(mktemp --suffix=.json)
+cleanup() { rm -f "$TMPHTML" "$TMPJSON"; }
 trap cleanup EXIT
 
-# Build an HTML page whose JavaScript displays the user agent as a header.
-cat > "$TMPHTML" <<EOF
+# Generate a ~5 MB JSON document (array of 10 000 objects).
+python3 -c "
+import json, hashlib
+data = []
+for i in range(10000):
+    h = hashlib.sha256(str(i).encode()).hexdigest()
+    data.append({
+        'id': i,
+        'hash': h,
+        'nested': {
+            'alpha': h[:16],
+            'beta': h[16:32],
+            'gamma': h[32:48],
+            'delta': h[48:],
+            'values': [i * j for j in range(20)]
+        },
+        'tags': ['tag-' + str(i % k) for k in range(1, 8)],
+        'active': i % 3 != 0,
+        'description': 'Record number {} with hash {}'.format(i, h)
+    })
+json.dump(data, open('$TMPJSON', 'w'))
+"
+
+# Build an HTML page that fetches and parses the JSON, then displays results.
+cat > "$TMPHTML" <<HTMLEOF
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Chrome ${CHROME_MILESTONE:-}</title>
+  <title>Chrome ${CHROME_MILESTONE:-} JSON Benchmark</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; }
-    h1 { font-size: 1.5rem; }
+    h1 { font-size: 1.4rem; margin: 0.4rem 0; }
+    .label { color: #555; font-size: 0.9rem; }
   </style>
 </head>
 <body>
   <h1 id="ua"></h1>
+  <h1 id="timing"></h1>
+  <h1 id="ts"></h1>
   <script>
     document.getElementById("ua").textContent = navigator.userAgent;
+
+    // Fetch and parse the JSON document.
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "file://${TMPJSON}", false);   // synchronous
+    xhr.send();
+    var raw = xhr.responseText;
+
+    var t0 = performance.now();
+    var parsed = JSON.parse(raw);
+    var t1 = performance.now();
+
+    var elapsed = (t1 - t0).toFixed(2);
+    document.getElementById("timing").textContent =
+        "Parsed " + parsed.length + " records (" +
+        (raw.length / 1024 / 1024).toFixed(2) + " MB) in " + elapsed + " ms";
+
+    document.getElementById("ts").textContent =
+        "Timestamp: " + new Date().toISOString();
   </script>
 </body>
 </html>
-EOF
+HTMLEOF
 
 SCREENSHOT_PATH="${SCREENSHOT_DIR}/chrome-${CHROME_MILESTONE}.png"
 
@@ -57,7 +103,8 @@ SCREENSHOT_PATH="${SCREENSHOT_DIR}/chrome-${CHROME_MILESTONE}.png"
     --headless \
     --no-sandbox \
     --disable-gpu \
-    --window-size=800,200 \
+    --allow-file-access-from-files \
+    --window-size=900,250 \
     --screenshot="$SCREENSHOT_PATH" \
     "file://${TMPHTML}" 2>/dev/null
 
@@ -68,5 +115,6 @@ echo "Screenshot saved: $SCREENSHOT_PATH"
     --headless \
     --no-sandbox \
     --disable-gpu \
+    --allow-file-access-from-files \
     --dump-dom \
     "file://${TMPHTML}" 2>/dev/null
