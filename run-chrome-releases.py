@@ -161,6 +161,17 @@ def download_and_extract(url, dest_dir):
         urllib.request.urlretrieve(url, tmp_path)
         with zipfile.ZipFile(tmp_path) as zf:
             zf.extractall(dest_dir)
+            # Restore Unix file permissions from the zip metadata.
+            # Python's extractall does not do this by default, which
+            # leaves binaries like chrome_crashpad_handler non-executable.
+            for info in zf.infolist():
+                if info.external_attr:
+                    perm = info.external_attr >> 16
+                    if perm:
+                        os.chmod(
+                            os.path.join(dest_dir, info.filename),
+                            perm,
+                        )
     finally:
         os.close(fd)
         os.unlink(tmp_path)
