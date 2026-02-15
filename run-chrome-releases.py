@@ -27,8 +27,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -57,6 +59,15 @@ DASH_PLATFORMS = {
     "mac-arm64": "Mac",
     "win64": "Windows",
 }
+
+# Lock for printing from parallel workers.
+_print_lock = threading.Lock()
+
+
+def log(msg="", end="\n"):
+    """Thread-safe print."""
+    with _print_lock:
+        print(msg, end=end, flush=True)
 
 
 def detect_platform():
@@ -152,12 +163,12 @@ def build_release_list(cft_data, release_dates, cft_platform, years):
     return releases
 
 
-def download_and_extract(url, dest_dir):
+def download_and_extract(url, dest_dir, label=""):
     """Download a zip from url and extract it to dest_dir. Returns the path to
     the extracted top-level directory."""
     fd, tmp_path = tempfile.mkstemp(suffix=".zip")
     try:
-        print(f"    Downloading {url.split('/')[-1]}...")
+        log(f"  {label}  Downloading {url.split('/')[-1]}...")
         urllib.request.urlretrieve(url, tmp_path)
         with zipfile.ZipFile(tmp_path) as zf:
             zf.extractall(dest_dir)
@@ -224,33 +235,198 @@ def find_chromedriver_binary(driver_dir):
     return None
 
 
-def run_script(script, env, timeout=None):
+def run_script(script, env, timeout=None, capture=False):
     """Run the user's script with the given environment.
 
-    Returns (exit_code, duration_seconds).
+    Returns (exit_code, duration_seconds, stdout_text).
+    When capture=False stdout_text is empty.
     """
     start = datetime.now()
+    stdout_arg = subprocess.PIPE if capture else None
+    stderr_arg = subprocess.STDOUT if capture else None
     try:
         result = subprocess.run(
             [script],
             env=env,
             timeout=timeout,
             shell=False,
+            stdout=stdout_arg,
+            stderr=stderr_arg,
         )
         duration = (datetime.now() - start).total_seconds()
-        return result.returncode, duration
+        output = result.stdout.decode(errors="replace") if capture and result.stdout else ""
+        return result.returncode, duration, output
     except subprocess.TimeoutExpired:
         duration = (datetime.now() - start).total_seconds()
-        return -1, duration
+        return -1, duration, ""
     except PermissionError:
         # Try running through sh.
         result = subprocess.run(
             ["sh", script],
             env=env,
             timeout=timeout,
+            stdout=stdout_arg,
+            stderr=stderr_arg,
         )
         duration = (datetime.now() - start).total_seconds()
-        return result.returncode, duration
+        output = result.stdout.decode(errors="replace") if capture and result.stdout else ""
+        return result.returncode, duration, output
+
+
+def process_release(release, script, cache_dir, timeout, parallel):
+    """Download Chrome, run the script, and return a result dict.
+
+    This function is safe to call from a thread.
+    """
+    milestone = release["milestone"]
+    version = release["version"]
+    tag = f"[Chrome {milestone}]"
+
+    if cache_dir:
+        chrome_extract_dir = os.path.join(cache_dir, f"chrome-{version}")
+        driver_extract_dir = os.path.join(cache_dir, f"chromedriver-{version}")
+        use_cache = True
+    else:
+        chrome_extract_dir = tempfile.mkdtemp(prefix=f"chrome-{milestone}-")
+        driver_extract_dir = tempfile.mkdtemp(prefix=f"chromedriver-{milestone}-")
+        use_cache = False
+
+    try:
+        # Download and extract Chrome.
+        chrome_dir = None
+        if use_cache and os.path.isdir(chrome_extract_dir):
+            log(f"  {tag}  Using cached Chrome...")
+            entries = list(Path(chrome_extract_dir).iterdir())
+            chrome_dir = str(entries[0]) if len(entries) == 1 and entries[0].is_dir() else chrome_extract_dir
+        else:
+            os.makedirs(chrome_extract_dir, exist_ok=True)
+            chrome_dir = download_and_extract(release["chrome_url"], chrome_extract_dir, label=tag)
+
+        chrome_bin = find_chrome_binary(chrome_dir)
+        if not chrome_bin:
+            log(f"  {tag}  ERROR: Could not find Chrome binary in {chrome_dir}")
+            return {
+                "milestone": milestone, "version": version,
+                "exit_code": -2, "error": "binary not found", "output": "",
+            }
+
+        # Download and extract chromedriver (optional).
+        chromedriver_dir = None
+        chromedriver_bin = ""
+        if release.get("chromedriver_url"):
+            if use_cache and os.path.isdir(driver_extract_dir):
+                log(f"  {tag}  Using cached chromedriver...")
+                entries = list(Path(driver_extract_dir).iterdir())
+                chromedriver_dir = str(entries[0]) if len(entries) == 1 and entries[0].is_dir() else driver_extract_dir
+            else:
+                os.makedirs(driver_extract_dir, exist_ok=True)
+                chromedriver_dir = download_and_extract(release["chromedriver_url"], driver_extract_dir, label=tag)
+            chromedriver_bin = find_chromedriver_binary(chromedriver_dir) or ""
+
+        # Build environment for the user's script.
+        env = os.environ.copy()
+        env["CHROME_VERSION"] = version
+        env["CHROME_MILESTONE"] = str(milestone)
+        env["CHROME_DIR"] = chrome_dir
+        env["CHROME_BIN"] = chrome_bin
+        env["CHROME_RELEASE_DATE"] = release["release_date"]
+        env["CHROMEDRIVER_BIN"] = chromedriver_bin
+        env["CHROMEDRIVER_DIR"] = chromedriver_dir or ""
+
+        # Run the user's script.
+        log(f"  {tag}  Running script...")
+        exit_code, duration, output = run_script(
+            script, env, timeout=timeout, capture=parallel,
+        )
+
+        status = "OK" if exit_code == 0 else ("TIMEOUT" if exit_code == -1 else f"FAILED ({exit_code})")
+        log(f"  {tag}  {status} ({duration:.1f}s)")
+
+        return {
+            "milestone": milestone,
+            "version": version,
+            "exit_code": exit_code,
+            "duration": duration,
+            "output": output,
+        }
+
+    finally:
+        if not use_cache:
+            shutil.rmtree(chrome_extract_dir, ignore_errors=True)
+            shutil.rmtree(driver_extract_dir, ignore_errors=True)
+
+
+def run_sequential(releases, script, cache_dir, timeout, continue_on_error):
+    """Run releases one at a time (original behaviour)."""
+    results = []
+    interrupted = False
+
+    def handle_sigint(sig, frame):
+        nonlocal interrupted
+        interrupted = True
+        print("\nInterrupted. Finishing current release...")
+
+    prev_handler = signal.signal(signal.SIGINT, handle_sigint)
+
+    for i, release in enumerate(releases):
+        if interrupted:
+            break
+
+        milestone = release["milestone"]
+        version = release["version"]
+        print(f"[{i+1}/{len(releases)}] Chrome {milestone} ({version}, {release['release_date']})")
+
+        result = process_release(release, script, cache_dir, timeout, parallel=False)
+        results.append(result)
+
+        if result["exit_code"] != 0 and not continue_on_error:
+            print("    Stopping due to failure (use --continue-on-error to keep going).")
+            break
+
+    signal.signal(signal.SIGINT, prev_handler)
+    return results
+
+
+def run_parallel(releases, script, cache_dir, timeout, continue_on_error, jobs):
+    """Run releases in parallel using a thread pool."""
+    total = len(releases)
+    log(f"Running {total} releases with {jobs} parallel workers\n")
+
+    results_by_milestone = {}
+    completed_count = 0
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        future_to_release = {
+            pool.submit(process_release, r, script, cache_dir, timeout, parallel=True): r
+            for r in releases
+        }
+
+        try:
+            for future in as_completed(future_to_release):
+                result = future.result()
+                results_by_milestone[result["milestone"]] = result
+                completed_count += 1
+                log(f"  Completed {completed_count}/{total}: Chrome {result['milestone']}")
+        except KeyboardInterrupt:
+            log("\nInterrupted. Cancelling remaining tasks...")
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    # Print captured output in milestone order.
+    print("\n" + "-" * 60)
+    print("Output")
+    print("-" * 60)
+    for release in releases:
+        m = release["milestone"]
+        if m not in results_by_milestone:
+            continue
+        result = results_by_milestone[m]
+        output = result.get("output", "").strip()
+        if output:
+            print(f"\n--- Chrome {m} ({release['version']}) ---")
+            print(output)
+
+    # Return results sorted by milestone.
+    return [results_by_milestone[r["milestone"]] for r in releases if r["milestone"] in results_by_milestone]
 
 
 def main():
@@ -262,6 +438,12 @@ def main():
     parser.add_argument(
         "script",
         help="Path to the shell script to run for each Chrome release.",
+    )
+    parser.add_argument(
+        "-j", "--jobs",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1 = sequential).",
     )
     parser.add_argument(
         "--platform",
@@ -348,100 +530,12 @@ def main():
         cache_dir = os.path.abspath(args.cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
 
-    results = []
-    interrupted = False
+    jobs = max(1, args.jobs)
 
-    def handle_sigint(sig, frame):
-        nonlocal interrupted
-        interrupted = True
-        print("\nInterrupted. Finishing current release...")
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    for i, release in enumerate(releases):
-        if interrupted:
-            break
-
-        milestone = release["milestone"]
-        version = release["version"]
-        print(f"[{i+1}/{len(releases)}] Chrome {milestone} ({version}, {release['release_date']})")
-
-        # Determine where to extract.
-        if cache_dir:
-            chrome_extract_dir = os.path.join(cache_dir, f"chrome-{version}")
-            driver_extract_dir = os.path.join(cache_dir, f"chromedriver-{version}")
-            use_cache = True
-        else:
-            chrome_extract_dir = tempfile.mkdtemp(prefix=f"chrome-{milestone}-")
-            driver_extract_dir = tempfile.mkdtemp(prefix=f"chromedriver-{milestone}-")
-            use_cache = False
-
-        try:
-            # Download and extract Chrome.
-            chrome_dir = None
-            chrome_bin = None
-            if use_cache and os.path.isdir(chrome_extract_dir):
-                print("    Using cached Chrome...")
-                # Find the nested directory.
-                entries = list(Path(chrome_extract_dir).iterdir())
-                chrome_dir = str(entries[0]) if len(entries) == 1 and entries[0].is_dir() else chrome_extract_dir
-            else:
-                os.makedirs(chrome_extract_dir, exist_ok=True)
-                chrome_dir = download_and_extract(release["chrome_url"], chrome_extract_dir)
-
-            chrome_bin = find_chrome_binary(chrome_dir)
-            if not chrome_bin:
-                print(f"    ERROR: Could not find Chrome binary in {chrome_dir}")
-                results.append({"milestone": milestone, "version": version, "exit_code": -2, "error": "binary not found"})
-                if not args.continue_on_error:
-                    break
-                continue
-
-            # Download and extract chromedriver (optional).
-            chromedriver_dir = None
-            chromedriver_bin = ""
-            if release.get("chromedriver_url"):
-                if use_cache and os.path.isdir(driver_extract_dir):
-                    print("    Using cached chromedriver...")
-                    entries = list(Path(driver_extract_dir).iterdir())
-                    chromedriver_dir = str(entries[0]) if len(entries) == 1 and entries[0].is_dir() else driver_extract_dir
-                else:
-                    os.makedirs(driver_extract_dir, exist_ok=True)
-                    chromedriver_dir = download_and_extract(release["chromedriver_url"], driver_extract_dir)
-                chromedriver_bin = find_chromedriver_binary(chromedriver_dir) or ""
-
-            # Build environment for the user's script.
-            env = os.environ.copy()
-            env["CHROME_VERSION"] = version
-            env["CHROME_MILESTONE"] = str(milestone)
-            env["CHROME_DIR"] = chrome_dir
-            env["CHROME_BIN"] = chrome_bin
-            env["CHROME_RELEASE_DATE"] = release["release_date"]
-            env["CHROMEDRIVER_BIN"] = chromedriver_bin
-            env["CHROMEDRIVER_DIR"] = chromedriver_dir or ""
-
-            # Run the user's script.
-            print(f"    Running: {script}")
-            exit_code, duration = run_script(script, env, timeout=args.timeout)
-
-            status = "OK" if exit_code == 0 else ("TIMEOUT" if exit_code == -1 else f"FAILED ({exit_code})")
-            print(f"    Result: {status} ({duration:.1f}s)")
-            results.append({
-                "milestone": milestone,
-                "version": version,
-                "exit_code": exit_code,
-                "duration": duration,
-            })
-
-            if exit_code != 0 and not args.continue_on_error:
-                print("    Stopping due to failure (use --continue-on-error to keep going).")
-                break
-
-        finally:
-            # Clean up temp directories if not caching.
-            if not use_cache:
-                shutil.rmtree(chrome_extract_dir, ignore_errors=True)
-                shutil.rmtree(driver_extract_dir, ignore_errors=True)
+    if jobs == 1:
+        results = run_sequential(releases, script, cache_dir, args.timeout, args.continue_on_error)
+    else:
+        results = run_parallel(releases, script, cache_dir, args.timeout, args.continue_on_error, jobs)
 
     # Print summary.
     print("\n" + "=" * 60)
